@@ -183,7 +183,7 @@ def join_keyboard():
 
 def show_winners_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏆 Giveaway & Show Winners Name", callback_data="show_winners")],
+        [InlineKeyboardButton("🏆 Giveaway Winners Name", callback_data="show_winners")],
         [InlineKeyboardButton("📢 SF Giveaway Channel", url=GIVEAWAY_CHANNEL_URL)],
     ])
 
