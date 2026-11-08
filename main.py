@@ -39,37 +39,90 @@ def save_subscriber(user):
 
 
 def validate_giveaway_db(path=DATABASE_FILE):
+    """Validate the source giveaway DB. Winners are calculated from users/referrals;
+    giveaway_results is optional because older backups may leave it empty."""
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         return False, "Database file missing or empty."
     try:
         with sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True) as db:
             check = db.execute("PRAGMA integrity_check").fetchone()
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            required = {"users", "referrals"}
             if not check or check[0] != "ok":
                 return False, "SQLite integrity check failed."
-            if not {"users", "giveaway_results"}.issubset(tables):
-                return False, "This is not a compatible SF ARMY giveaway database (users/giveaway_results missing)."
+            if not required.issubset(tables):
+                return False, "Incompatible giveaway database: users/referrals table missing."
+            user_cols = {r[1] for r in db.execute("PRAGMA table_info(users)")}
+            referral_cols = {r[1] for r in db.execute("PRAGMA table_info(referrals)")}
+            if not {"user_id", "username", "first_name", "last_name", "total_coins", "verified"}.issubset(user_cols):
+                return False, "Users table is missing required columns."
+            if not {"inviter_id", "status", "verified_at"}.issubset(referral_cols):
+                return False, "Referrals table is missing required columns."
         return True, "OK"
     except Exception as exc:
         return False, str(exc)
 
 
 def get_winners():
+    """Calculate finalized qualified winners directly from the original giveaway DB.
+
+    This deliberately does not depend on giveaway_results being populated.
+    Qualification is based on eligible verified referrals before the configured
+    giveaway cutoff. Ranking within qualified users uses total_coins.
+    """
     ok, reason = validate_giveaway_db()
     if not ok:
         raise RuntimeError(reason)
+
     with sqlite3.connect(f"file:{os.path.abspath(DATABASE_FILE)}?mode=ro", uri=True) as db:
         db.row_factory = sqlite3.Row
-        rows = db.execute("""
-            SELECT r.user_id, r.final_rank, r.username AS result_username,
-                   r.first_name AS result_first_name, r.last_name AS result_last_name,
-                   r.verified_referrals, r.referral_coins,
-                   u.username AS live_username, u.first_name AS live_first_name,
-                   u.last_name AS live_last_name, u.total_coins
-            FROM giveaway_results r LEFT JOIN users u ON u.user_id=r.user_id
-            ORDER BY r.final_rank ASC
-        """).fetchall()
-        return [dict(x) for x in rows]
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        cutoff = "2026-11-08 12:00:00"
+        if "giveaway_state" in tables:
+            state = db.execute(
+                "SELECT state_value FROM giveaway_state WHERE state_key='configured_cutoff'"
+            ).fetchone()
+            if state and state[0]:
+                cutoff = state[0]
+
+        ref_cols = {r[1] for r in db.execute("PRAGMA table_info(referrals)")}
+        eligible_clause = "r.status='verified' AND r.verified_at IS NOT NULL AND r.verified_at<=?"
+        if "giveaway_eligible" in ref_cols:
+            eligible_clause += " AND r.giveaway_eligible=1"
+        if "post_deadline" in ref_cols:
+            eligible_clause += " AND r.post_deadline=0"
+
+        rows = db.execute(f"""
+            WITH eligible AS (
+                SELECT r.inviter_id, r.verified_at, r.id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY r.inviter_id
+                           ORDER BY r.verified_at ASC, r.id ASC
+                       ) AS referral_number
+                FROM referrals r
+                WHERE {eligible_clause}
+            ), referral_stats AS (
+                SELECT inviter_id,
+                       COUNT(*) AS verified_referrals,
+                       MAX(CASE WHEN referral_number=? THEN verified_at END) AS qualified_at
+                FROM eligible
+                GROUP BY inviter_id
+                HAVING COUNT(*) >= ?
+            )
+            SELECT u.user_id, u.username, u.first_name, u.last_name,
+                   u.total_coins,
+                   rs.verified_referrals,
+                   rs.qualified_at
+            FROM referral_stats rs
+            JOIN users u ON u.user_id=rs.inviter_id
+            WHERE u.verified=1
+            ORDER BY COALESCE(u.total_coins,0) DESC,
+                     rs.verified_referrals DESC,
+                     rs.qualified_at ASC,
+                     u.user_id ASC
+        """, (cutoff, QUALIFICATION_REFERRALS, QUALIFICATION_REFERRALS)).fetchall()
+
+        return [dict(row) for row in rows]
 
 
 def winner_text():
@@ -85,12 +138,11 @@ def winner_text():
         "━━━━━━━━━━━━━━━━━━",
     ]
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for r in rows:
-        rank = int(r["final_rank"])
-        first = (r.get("live_first_name") or r.get("result_first_name") or "").strip()
-        last = (r.get("live_last_name") or r.get("result_last_name") or "").strip()
+    for rank, r in enumerate(rows, start=1):
+        first = (r.get("first_name") or "").strip()
+        last = (r.get("last_name") or "").strip()
         name = (first + " " + last).strip() or "Unknown User"
-        username = r.get("live_username") or r.get("result_username")
+        username = r.get("username")
         handle = "@" + username.lstrip("@") if username else "Not Set"
         coins = int(r.get("total_coins") or 0)
         referrals = int(r.get("verified_referrals") or 0)
